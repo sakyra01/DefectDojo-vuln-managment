@@ -1,52 +1,26 @@
 import re
-from decouple import config
-import requests
-import logging
-from pyExploitDb import PyExploitDb
+import time
 from tenable import tenable_serf, www
-import json
+from connection import check_connection, get_request, post_request, logger, pEdb
 
 
-# On Logger + updating db pyExploitDB
-pEdb = PyExploitDb()
-pEdb.debug = False
-Log_Format = "%(levelname)s %(asctime)s - %(message)s"
-logging.basicConfig(filename="logfile.log",
-                    filemode="w",
-                    format=Log_Format,
-                    level=logging.INFO)
-logger = logging.getLogger()
-
-
-def get_request():
-    uri = config('URL')  # your dd api uri
-    token = config('Token')  # your dd api token
-    headers = {'content-type': 'application/json', 'Authorization': token}
-    content = requests.get(uri, headers=headers, verify=True)  # set verify to False if ssl cert is self-signed
-    return content
-
-
-def post_request(tags, finding_id):
-    uri = config('POST_URL')  # path to api finding id + tags
-    uri = f'{uri}{finding_id}/tags/'  # sum full path
-    token = config('Token')  # your dd api token
-    body = {"tags": tags}
-    headers = {'content-type': 'application/json', 'Authorization': token}
-    requests.post(uri, headers=headers, verify=True, json=body)
-
-
-def regex(lines):
-    for line in lines:
-        if re.match(r"CVE-\d{4}-\d{4,7}", line) or re.match(r"(?i)\bcve-\d{4}-\d{4,7}", line):
-            return line
+def regex(line):
+    new_line = line.split()
+    for li in new_line:
+        result = re.search(r"CVE-\d{4}-\d{4,7}", li)
+        if result is not None:
+            return result.group(0)
 
 
 def tenable_enumeration(cve):
     tenable_url = f'https://www.tenable.com/plugins/search?q=%22{cve}%22&sort=vpr_score&page=1'
+    time.sleep(10)  # bypassing request block possibility
     middle_page = tenable_serf(tenable_url)
-    tenable_page = www(middle_page)
-    js_payload = json.dumps(tenable_page, indent=4)
-    return js_payload
+    if middle_page is not None:
+        tenable_page = www(middle_page)
+        return tenable_page
+    else:
+        return middle_page
 
 
 def find_cve_fields(field):
@@ -55,20 +29,29 @@ def find_cve_fields(field):
 
 
 def tenable(cve, finding_id):
+    tenable_data = []
     cve_tenable = tenable_enumeration(cve)  # Call function which parsing tenable source
-    if cve_tenable == "{}":
-        logger.error(f"Information in Tenable does not exist for finding - {finding_id}")
+    if cve_tenable is None:
+        logger.error(f"Information in Tenable does not exist for finding-{finding_id}")
         return
     else:
-        logger.error(f"Made Tenable Tag for finding - {finding_id}")
-        return cve_tenable
+        for x in cve_tenable:
+            if x == 'Exploit Available' and cve_tenable[x] == ' true':
+                tenable_tag = True
+                tenable_data.append(tenable_tag)
+                logger.info(f"Made tenable-db tag for finding-{finding_id}")
+            if x == 'Risk':
+                tenable_score = f"VPR_{cve_tenable[x]}"
+                tenable_data.append(tenable_score)
+                logger.info(f"Made {tenable_score} tag for finding-{finding_id}")
+        return tenable_data
 
 
 def exploitdb(cve, finding_id):
     cve_db = pEdb.searchCve(cve)  # Searching cve value in pEdb databases
     if len(cve_db) != 0:
-        cve_db_references = f"{finding_id}: https://www.exploit-db.com/exploits/{cve_db['id']}"
-        logger.info(f"Made Exploit-DB tag for finding - {finding_id}")
+        cve_db_references = f"https://www.exploit-db.com/exploits/{cve_db['id']}"
+        logger.info(f"Exploit link-{cve_db_references} for finding-{finding_id}")
         return cve_db_references
     else:
         logger.error(f"Exploit for {cve} does not exist")
@@ -95,30 +78,33 @@ def enumeration():
             tenable_list = tenable(cve, finding_id)
             exploitdb_ref = exploitdb(cve, finding_id)
         else:  # condition to find cve in fields
-            if len(finding_title) != 0 and cve == '':
+            if len(finding_title) != 0 and cve is None:
                 cve = find_cve_fields(finding_title)
-                tenable_list = tenable(cve, finding_id)
-                exploitdb_ref = exploitdb(cve, finding_id)
-            elif len(finding_description) != 0 and cve == '':
+                if cve is not None:
+                    tenable_list = tenable(cve, finding_id)
+                    exploitdb_ref = exploitdb(cve, finding_id)
+            if len(finding_description) != 0 and cve is None:
                 cve = find_cve_fields(finding_description)
-                tenable_list = tenable(cve, finding_id)
-                exploitdb_ref = exploitdb(cve, finding_id)
-            elif len(finding_references) != 0 and cve == '':
+                if cve is not None:
+                    tenable_list = tenable(cve, finding_id)
+                    exploitdb_ref = exploitdb(cve, finding_id)
+            if len(finding_references) != 0 and cve is None:
                 cve = find_cve_fields(finding_references)
-                tenable_list = tenable(cve, finding_id)
-                exploitdb_ref = exploitdb(cve, finding_id)
-            else:
-                logger.error(f"CVE value didn't find in finding - {finding_id}")
+                if cve is not None:
+                    tenable_list = tenable(cve, finding_id)
+                    exploitdb_ref = exploitdb(cve, finding_id)
+            if cve is None:
+                logger.error(f"CVE didn't find in finding-{finding_id}")
 
-        # Condition if tag in finding, don't touch it
-        if tenable_list != "{}" and "tenable-db" not in finding_tags:
-            tenable_tag = "tenable-db"
-            tags.append(tenable_tag)
-        if exploitdb_ref is not None and "exploit-db" not in finding_tags:
-            exploitdb_tag = "exploit-db"
-            tags.append(exploitdb_tag)
-        if tags is not None:
-            post_request(tags, finding_id)
+        # # Uncomment when we need add tags to findings (active phase)
+        # if tenable_list != "{}" and "tenable-db" not in finding_tags:
+        #     tenable_tag = "tenable-db"
+        #     tags.append(tenable_tag)
+        # if exploitdb_ref is not None and "exploit-db" not in finding_tags:
+        #     exploitdb_tag = "exploit-db"
+        #     tags.append(exploitdb_tag)
+        # if tags is not None:
+        #     post_request(tags, finding_id)
 
 
 if __name__ == '__main__':
@@ -127,18 +113,20 @@ if __name__ == '__main__':
     # Update DB exploit-db from https://gitlab.com/exploit-database/exploitdb
     try:
         pEdb.openFile()
-        logger.info("exploit-db local DB updated successfully")
+        logger.info("Exploit-db local DB updated successfully")
     except RuntimeError:
-        logger.error("exploit-db can't update")
+        logger.error("Exploit-db can't update")
 
     # Checking connection to API DefectDojo
     try:
-        r = get_request()
+        check_connection()
         logger.info("Successfully obtained all vulnerabilities")
     except ConnectionError:
         logger.error("Connection error")
 
     # Checking status of response page and switch to function workers
+    num = check_connection()
+    r = get_request(num)
     if r.status_code == 200:
         enumeration()
     else:
