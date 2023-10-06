@@ -1,1 +1,1 @@
-<img src="dailer.png" alt="drawing" width="300"/>
+<img src="Dailer.png" alt="drawing" width="300"/>
